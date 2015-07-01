@@ -1,10 +1,12 @@
-﻿using System;
+﻿using NuGet;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.Versioning;
 using System.Xml.Linq;
 
 namespace InfragisticsNupackager
@@ -19,130 +21,149 @@ namespace InfragisticsNupackager
             "WindowsBase",
         };
 
+        private const string _targetFramework = "net40";
+
         static void Main()
         {
-            if (!CanRun("NuGet.exe"))
+            var currentDirectory = Directory.GetCurrentDirectory();
+
+            // We only care about packaging Infragistics dlls
+            var searchPattern = "Infragistics*.dll";
+
+            foreach (var path in Directory.EnumerateFiles(currentDirectory, searchPattern, SearchOption.TopDirectoryOnly))
             {
-                Console.WriteLine("Cannot find NuGet.exe, won't continue");
-                Console.ReadKey(true);
-                return;
-            }
-
-            foreach (var path in Directory.EnumerateFiles(Directory.GetCurrentDirectory(), "*.v14.2.dll"))
-            {
-                var assembly = Assembly.ReflectionOnlyLoadFrom(path);
-                var packageName = RemoveInfragisticsVersionTag(assembly.GetName().Name);
-                Console.Write(packageName);
-
-                var references = assembly.GetReferencedAssemblies().SelectMany(SelectReferenceKind).ToList();
-                if (references.Any(reference => reference.Item1 == ReferenceKind.BrokenReference))
-                {
-                    Console.WriteLine(" One or more of the assembly's references could not be loaded: {0}", string.Join(", ", from r in references where r.Item1 == ReferenceKind.BrokenReference select r.Item2));
-                    continue;
-                }
-
-                Console.Write(" Description: ");
-                var description = Console.ReadLine();
-
-                SavePackage(packageName, description, references, path);
-            }
-
-            long completedCount = 0;
-            var failedSpecs = new List<string>();
-
-            foreach (var nuspec in Directory.EnumerateFiles(Directory.GetCurrentDirectory(), "*.nuspec").Select(Path.GetFileName))
-            {
-                Console.Write("Packing {0}... ", nuspec);
                 try
                 {
-                    var processStart = new ProcessStartInfo("NuGet.exe", string.Format("pack {0}", nuspec)) {CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden};
-                    var process = Process.Start(processStart);
-                    process.WaitForExit();
-                    Console.WriteLine("Completed");
-                    completedCount++;
+                    var assembly = Assembly.ReflectionOnlyLoadFrom(path);
+                    var packageName = GetPackageName(assembly.GetName());
+                    Console.Write("{0}... ", packageName);
+
+                    var references = GetReferences(assembly).ToList();
+                    if (references.Any(reference => reference.Type == ReferenceKind.BrokenReference))
+                    {
+                        Console.WriteLine("FAILED");
+                        Console.WriteLine("One or more of the assembly's references could not be loaded: {0}", string.Join(", ", from r in references where r.Type == ReferenceKind.BrokenReference select r.Assembly.Name));
+                        continue;
+                    }
+
+                    var metadata = GetPackageMetadata(path, references);
+                    var manifestFiles = GetManifestFiles(path);
+
+                    var packageBuilder = new PackageBuilder();
+
+                    packageBuilder.Populate(metadata);
+                    packageBuilder.PopulateFiles(currentDirectory, manifestFiles);
+
+                    using (var fileStream = File.Open(GetPackagePath(metadata), FileMode.Create, FileAccess.ReadWrite))
+                    {
+                        packageBuilder.Save(fileStream);
+                    }
+                    Console.WriteLine("DONE");
                 }
-                catch (Exception)
+                catch(Exception e)
                 {
-                    Console.WriteLine("Could not complete");
+                    Console.WriteLine("FAILED");
+                    Console.WriteLine(e);
+                    Console.WriteLine();
                 }
             }
 
             Console.WriteLine();
-            Console.WriteLine("{0} nuspecs packaged successfully.", completedCount);
-            if (failedSpecs.Any())
-                Console.WriteLine("Following nuspecs could not be packaged: {0}", string.Join(", ", failedSpecs));
+            Console.WriteLine("Finished, press any key to quit.");
+
             Console.ReadKey(true);
         }
 
-        private static void SavePackage(string packageName, string description, List<Tuple<ReferenceKind, string>> references, string path)
+        private static string GetPackageName(AssemblyName assemblyName)
         {
-            var n = XNamespace.Get("http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd");
-            var package = new XElement(n + "package",
-                new XElement(n + "metadata",
-                    new XElement(n + "id", packageName),
-                    new XElement(n + "version", "14.2"),
-                    new XElement(n + "authors", "Infragistics"),
-                    new XElement(n + "description", description),
-                    references.Any(r => r.Item1 == ReferenceKind.GacReference)
-                        ? new XElement(n + "frameworkAssemblies",
-                            from r in references
-                            where r.Item1 == ReferenceKind.GacReference
-                            select new XElement(n + "frameworkAssembly", new XAttribute("assemblyName", r.Item2), new XAttribute("targetFramework", "net40")))
-                        : null,
-                    references.Any(r => r.Item1 == ReferenceKind.LocalReference)
-                        ? new XElement(n + "dependencies",
-                            new XElement(n + "group",
-                                new XAttribute("targetFramework", "net40"),
-                                from r in references
-                                where r.Item1 == ReferenceKind.LocalReference
-                                select new XElement(n + "dependency", new XAttribute("id", r.Item2), new XAttribute("version", "14.2"))))
-                        : null),
-                new XElement(n + "files",
-                    new XElement(n + "file", new XAttribute("src", Path.GetFileName(path)), new XAttribute("target", @"lib\net40"))));
+            var versionTag = string.Format(".v{0}.{1}", assemblyName.Version.Major, assemblyName.Version.Minor);
 
-            package.Save(packageName + ".14.2.nuspec");
+            return RemoveVersionTag(assemblyName.Name, versionTag);
         }
 
-        private static IEnumerable<Tuple<ReferenceKind, string>> SelectReferenceKind(AssemblyName an)
+        private static string RemoveVersionTag(string assemblyname, string versionTag)
+        {
+            return assemblyname.EndsWith(versionTag) ? assemblyname.Remove(assemblyname.Length - versionTag.Length) : assemblyname;
+        }
+
+        private static IEnumerable<Reference> GetReferences(Assembly assembly)
+        {
+            return assembly.GetReferencedAssemblies().SelectMany(SelectReference);
+        }
+
+        private static IEnumerable<Reference> SelectReference(AssemblyName an)
         {
             try
             {
                 var ass = Assembly.ReflectionOnlyLoad(an.FullName);
                 if (!ass.GlobalAssemblyCache)
-                    return Tuple.Create(ReferenceKind.LocalReference, RemoveInfragisticsVersionTag(an.Name)).ToEnumerable();
-
-                return usefulGacReferences.Contains(an.Name)
-                    ? Tuple.Create(ReferenceKind.GacReference, an.Name).ToEnumerable()
-                    : Enumerable.Empty<Tuple<ReferenceKind, string>>();
+                {
+                    // We only care about Infragistics references
+                    if(an.Name.StartsWith("infragistics", StringComparison.InvariantCultureIgnoreCase))
+                        return new Reference { Type = ReferenceKind.LocalReference, Assembly = an }.ToEnumerable();
+                }
+                else if(usefulGacReferences.Contains(an.Name))
+                {
+                    return new Reference { Type = ReferenceKind.GacReference, Assembly = an }.ToEnumerable();
+                }
+                return Enumerable.Empty<Reference>();
             }
             catch (Exception)
             {
-                return Tuple.Create(ReferenceKind.BrokenReference, an.Name).ToEnumerable();
+                return new Reference { Type = ReferenceKind.GacReference, Assembly = an }.ToEnumerable();
             }
         }
 
-        private static string RemoveInfragisticsVersionTag(string assemblyname)
+        private static ManifestMetadata GetPackageMetadata(string filepath, IReadOnlyList<Reference> references)
         {
-            return assemblyname.EndsWith(".v14.2") ? assemblyname.Remove(assemblyname.Length - 6) : assemblyname;
+            var assembly = Assembly.ReflectionOnlyLoadFrom(filepath);
+            var assemblyName = assembly.GetName();
+
+            var packageName = GetPackageName(assemblyName);
+
+            var packageMetadata = new ManifestMetadata
+            {
+                Id = packageName,
+                Authors = "Infragistics",
+                Description = string.Format("This package contains the infragistics assembly {0}.", assemblyName.Name),
+                Version = assemblyName.Version.ToString(),
+            };
+
+            var frameworkAssemblies = (
+                from r in references
+                where r.Type == ReferenceKind.GacReference
+                select new ManifestFrameworkAssembly{ AssemblyName = r.Assembly.Name, TargetFramework = _targetFramework }
+                ).ToList();
+            var infragisticsDependencies = (
+                from r in references
+                where r.Type == ReferenceKind.LocalReference
+                select new ManifestDependency { Id = GetPackageName(r.Assembly), Version = r.Assembly.Version.ToString() }
+                ).ToList();
+
+            if (infragisticsDependencies.Any())
+                packageMetadata.DependencySets = new List<ManifestDependencySet> { new ManifestDependencySet { Dependencies = infragisticsDependencies, TargetFramework = _targetFramework } };
+
+            if (frameworkAssemblies.Any())
+                packageMetadata.FrameworkAssemblies = frameworkAssemblies;
+
+            return packageMetadata;
         }
 
-        private static bool CanRun(string exeName)
+        private static IEnumerable<ManifestFile> GetManifestFiles(string filepath)
         {
-            try
-            {
-                var p = new Process
-                {
-                    StartInfo = {UseShellExecute = false, FileName = "where", Arguments = exeName, RedirectStandardOutput = true, RedirectStandardError = true}
-                };
-                p.Start();
-                p.WaitForExit();
-                return p.ExitCode == 0;
-            }
-            catch (Win32Exception)
-            {
-                return false;
-            }
+            yield return new ManifestFile { Source = Path.GetFileName(filepath), Target = string.Format(@"lib\{0}", _targetFramework) };
         }
+
+        private static string GetPackagePath(ManifestMetadata metadata)
+        {
+            return Path.Combine(Directory.GetCurrentDirectory(), string.Format("{0}.{1}.nupkg", metadata.Id, metadata.Version));
+        }
+    }
+
+    internal struct Reference
+    {
+        public ReferenceKind Type { get; set; }
+        public AssemblyName Assembly { get; set; }
     }
 
     enum ReferenceKind
