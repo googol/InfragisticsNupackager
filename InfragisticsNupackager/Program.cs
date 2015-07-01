@@ -7,7 +7,7 @@ using System.Linq;
 using System.Reflection;
 using System.Xml.Linq;
 
-namespace InfragisticsNupkgAutomation
+namespace InfragisticsNupackager
 {
     class Program
     {
